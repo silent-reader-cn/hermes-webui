@@ -9402,6 +9402,23 @@ function _makeBindingsCombo(o){
         menu.appendChild(row);
       });
     }
+    // Position the menu FIXED to the trigger's viewport rect so the dialog's
+    // overflow:auto can never clip it. Flip upward when the bottom edge of
+    // the viewport would be hit.
+    const rect=trigger.getBoundingClientRect();
+    const menuHeight=Math.min(menu.scrollHeight||240, 320);
+    const spaceBelow=window.innerHeight-rect.bottom-8;
+    const flipUp=spaceBelow<menuHeight+8&&rect.top>spaceBelow;
+    if(flipUp){
+      menu.style.top='auto';
+      menu.style.bottom=(window.innerHeight-rect.top+6)+'px';
+    }else{
+      menu.style.top=(rect.bottom+4)+'px';
+      menu.style.bottom='auto';
+    }
+    menu.style.left=rect.left+'px';
+    menu.style.width=rect.width+'px';
+    menu.style.position='fixed';
     menu.classList.add('open');
     trigger.classList.add('open');
     trigger.setAttribute('aria-expanded','true');
@@ -9607,29 +9624,8 @@ function _showProjectBindingsDialog(proj){
   })();
 
   const wsWrap=_field('Workspaces',wsListEl);
-  dialog.appendChild(wsWrap);
-  dialog.appendChild(addRow);
-
-  // ── Auto-assign checkbox: file every session in bound workspaces ──
-  const aaRow=document.createElement('label');
-  aaRow.className='project-bindings-auto-assign';
-  const aaCb=document.createElement('input');
-  aaCb.type='checkbox';
-  aaCb.checked=!!proj.auto_assign;
-  aaRow.appendChild(aaCb);
-  const aaText=document.createElement('span');
-  const aaTitle=document.createElement('div');
-  aaTitle.className='aa-label';
-  aaTitle.textContent='Auto-assign sessions by workspace';
-  const aaHint=document.createElement('div');
-  aaHint.className='aa-hint';
-  aaHint.textContent='All existing and future sessions in the bound workspaces are filed under this project.';
-  aaText.appendChild(aaTitle);
-  aaText.appendChild(aaHint);
-  aaRow.appendChild(aaText);
-  dialog.appendChild(aaRow);
-
-  _seedWsList();
+  // NOTE: appended below Model/Reasoning effort (layout: config on top,
+  // workspace list + auto-assign underneath).
 
   // ── Model: name-first combobox cloned from the composer modelSelect ──
   const modelOptions=[{value:'',name:'(none) — inherit default'}];
@@ -9663,6 +9659,30 @@ function _showProjectBindingsDialog(proj){
     options:effortOptions,
   });
   dialog.appendChild(_field('Reasoning effort',effortCombo.el));
+
+  // ── Workspaces list + auto-assign (below the model/effort config) ──
+  dialog.appendChild(wsWrap);
+  dialog.appendChild(addRow);
+
+  const aaRow=document.createElement('label');
+  aaRow.className='project-bindings-auto-assign';
+  const aaCb=document.createElement('input');
+  aaCb.type='checkbox';
+  aaCb.checked=!!proj.auto_assign;
+  aaRow.appendChild(aaCb);
+  const aaText=document.createElement('span');
+  const aaTitle=document.createElement('div');
+  aaTitle.className='aa-label';
+  aaTitle.textContent='Auto-assign sessions by workspace';
+  const aaHint=document.createElement('div');
+  aaHint.className='aa-hint';
+  aaHint.textContent='All existing and future sessions in the bound workspaces are filed under this project.';
+  aaText.appendChild(aaTitle);
+  aaText.appendChild(aaHint);
+  aaRow.appendChild(aaText);
+  dialog.appendChild(aaRow);
+
+  _seedWsList();
 
   // ── Actions ──
   const btnRow=document.createElement('div');
