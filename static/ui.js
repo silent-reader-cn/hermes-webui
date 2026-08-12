@@ -1176,7 +1176,7 @@ function _remountMessageViewportAnchor(anchor){
   if(visIdx<0) return false;
   // A virtualized anchor may be outside the current DOM. Scroll to its virtual
   // row and render once so the semantic restore below has a real target.
-  _programmaticScroll=true;
+  _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
   container.scrollTop=_messageVirtualScrollTopForVisibleIdx(visWithIdx,visIdx,container);
   _messageVirtualWindowKey='';
   _messageViewportAnchorRemounting=true;
@@ -2374,22 +2374,268 @@ function _openMermaidLightbox(svgEl) {
   document.addEventListener('keydown', lb._keyHandler);
   return lb;
 }
+/* Mount pinch/pan/zoom gestures on an enlarged-image lightbox stage.
+ * Mirrors the Mermaid viewer's gesture architecture (see
+ * _mountMermaidViewer): Pointer Events drive single-finger drag/pan,
+ * Touch Events drive two-finger pinch-to-zoom, and the mouse wheel
+ * zooms anchored at the cursor. `touch-action: none` on the viewport
+ * is required so the browser never claims the touch sequence.
+ * state.pendingNav is set by _navigateLightbox to keep the zoom level
+ * while re-centring when switching to the next/previous image. */
+function _mountImgLightboxZoom(viewport, canvas, img, lb) {
+  const state = {
+    boxH: 0,
+    boxW: 0,
+    canvas,
+    dragOriginX: 0,
+    dragOriginY: 0,
+    dragStartX: 0,
+    dragStartY: 0,
+    dragged: false,
+    dragging: false,
+    fitScale: 1,
+    img,
+    pendingNav: false,
+    pinchStartCX: 0,
+    pinchStartCY: 0,
+    pinchStartDist: 0,
+    pinchStartScale: 1,
+    pinchStartX: 0,
+    pinchStartY: 0,
+    pinching: false,
+    scale: 1,
+    viewport,
+    x: 0,
+    y: 0,
+  };
+
+  function _viewportSize() {
+    const rect = viewport.getBoundingClientRect ? viewport.getBoundingClientRect() : null;
+    return {
+      width: Math.max(1, (rect && rect.width) || viewport.clientWidth || 1),
+      height: Math.max(1, (rect && rect.height) || viewport.clientHeight || 1),
+    };
+  }
+
+  function _applyTransform() {
+    canvas.style.transform = 'translate(' + Math.round(state.x) + 'px,' + Math.round(state.y) + 'px) scale(' + state.scale + ')';
+    canvas.style.transformOrigin = '0 0';
+  }
+
+  function _minScale() {
+    return Math.min(0.25, state.fitScale);
+  }
+
+  function _setScale(nextScale, anchorX, anchorY) {
+    const bounded = Math.max(_minScale(), Math.min(8, nextScale));
+    if(!Number.isFinite(bounded) || !state.boxW || !state.boxH) return;
+    const size = _viewportSize();
+    const focusX = Number.isFinite(anchorX) ? anchorX : size.width / 2;
+    const focusY = Number.isFinite(anchorY) ? anchorY : size.height / 2;
+    if(state.scale){
+      const ratio = bounded / state.scale;
+      state.x = focusX - (focusX - state.x) * ratio;
+      state.y = focusY - (focusY - state.y) * ratio;
+    }
+    state.scale = bounded;
+    _applyTransform();
+  }
+
+  function _fit() {
+    const size = _viewportSize();
+    if(!state.boxW || !state.boxH) return;
+    const fitScale = Math.min(size.width / state.boxW, size.height / state.boxH);
+    state.fitScale = fitScale;
+    state.scale = fitScale;
+    state.x = (size.width - state.boxW * fitScale) / 2;
+    state.y = (size.height - state.boxH * fitScale) / 2;
+    _applyTransform();
+  }
+
+  function _centerPan() {
+    const size = _viewportSize();
+    state.x = (size.width - state.boxW * state.scale) / 2;
+    state.y = (size.height - state.boxH * state.scale) / 2;
+    _applyTransform();
+  }
+
+  function _onImgLoad() {
+    const nw = img.naturalWidth || img.width || 0;
+    const nh = img.naturalHeight || img.height || 0;
+    state.boxW = nw || 800;
+    state.boxH = nh || 450;
+    canvas.style.width = state.boxW + 'px';
+    canvas.style.height = state.boxH + 'px';
+    if(state.pendingNav){
+      state.pendingNav = false;
+      _centerPan();
+    } else {
+      _fit();
+    }
+  }
+
+  function _onPointerDown(e) {
+    if(state.pinching) return;
+    if(e.button != null && e.button !== 0) return;
+    state.dragging = true;
+    state.dragged = false;
+    state.dragOriginX = Number(e.clientX) || 0;
+    state.dragOriginY = Number(e.clientY) || 0;
+    state.dragStartX = state.x;
+    state.dragStartY = state.y;
+    viewport.classList.add('is-panning');
+    if(viewport.setPointerCapture){
+      try{ viewport.setPointerCapture(e.pointerId); }catch(_){}
+    }
+    if(e.preventDefault) e.preventDefault();
+  }
+
+  function _onPointerMove(e) {
+    if(state.pinching || !state.dragging) return;
+    const dx = (Number(e.clientX) || 0) - state.dragOriginX;
+    const dy = (Number(e.clientY) || 0) - state.dragOriginY;
+    if(Math.abs(dx) + Math.abs(dy) > 3) state.dragged = true;
+    state.x = state.dragStartX + dx;
+    state.y = state.dragStartY + dy;
+    _applyTransform();
+  }
+
+  function _endPointerDrag() {
+    if(!state.dragging) return;
+    state.dragging = false;
+    viewport.classList.remove('is-panning');
+  }
+
+  function _onViewportClick(e) {
+    if(state.dragged){
+      state.dragged = false;
+    }
+    // Always stop the click from bubbling to the lightbox backdrop —
+    // otherwise the browser's post-drag click (pointerdown+up on the same
+    // element) closes the lightbox right after a pan, and plain clicks on
+    // the image should never close it either.
+    if(e.stopPropagation) e.stopPropagation();
+  }
+
+  function _touchDist(touches) {
+    if(!touches || touches.length < 2) return 0;
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function _onTouchStart(e) {
+    if(e.touches.length === 2){
+      state.pinching = true;
+      state.pinchStartDist = _touchDist(e.touches);
+      state.pinchStartScale = state.scale;
+      state.pinchStartX = state.x;
+      state.pinchStartY = state.y;
+      const rect = viewport.getBoundingClientRect();
+      state.pinchStartCX = (e.touches[0].clientX + e.touches[1].clientX) / 2 - (rect.left || 0);
+      state.pinchStartCY = (e.touches[0].clientY + e.touches[1].clientY) / 2 - (rect.top || 0);
+      _endPointerDrag();
+      if(e.preventDefault) e.preventDefault();
+    }
+  }
+
+  function _onTouchMove(e) {
+    if(!state.pinching || e.touches.length < 2) return;
+    const rect = viewport.getBoundingClientRect();
+    const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - (rect.left || 0);
+    const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - (rect.top || 0);
+    const currDist = _touchDist(e.touches);
+    if(state.pinchStartDist > 0 && state.pinchStartScale > 0){
+      const rawScale = state.pinchStartScale * (currDist / state.pinchStartDist);
+      const boundedScale = Math.max(_minScale(), Math.min(8, rawScale));
+      const ratio = boundedScale / state.pinchStartScale;
+      state.scale = boundedScale;
+      state.x = cx - (state.pinchStartCX - state.pinchStartX) * ratio;
+      state.y = cy - (state.pinchStartCY - state.pinchStartY) * ratio;
+      _applyTransform();
+    }
+    if(e.preventDefault) e.preventDefault();
+  }
+
+  function _onTouchEnd(e) {
+    if(e.touches.length < 2 && state.pinching){
+      state.pinching = false;
+      state.dragged = true;
+    }
+  }
+
+  function _zoomFromWheel(e) {
+    if(e.preventDefault) e.preventDefault();
+    const rect = viewport.getBoundingClientRect();
+    const anchorX = Number.isFinite(e.clientX) ? e.clientX - rect.left : undefined;
+    const anchorY = Number.isFinite(e.clientY) ? e.clientY - rect.top : undefined;
+    const factor = Math.exp((-(Number(e.deltaY) || 0)) * 0.0015);
+    _setScale(state.scale * factor, anchorX, anchorY);
+  }
+
+  function _onResize() {
+    if(lb._imgZoomResizeTimer && typeof clearTimeout === 'function') clearTimeout(lb._imgZoomResizeTimer);
+    lb._imgZoomResizeTimer = setTimeout(() => {
+      lb._imgZoomResizeTimer = null;
+      const wasAtFit = Math.abs(state.scale - state.fitScale) < 1e-9;
+      if(wasAtFit || !state.boxW){
+        _fit();
+      } else {
+        _centerPan();
+      }
+    }, 120);
+  }
+
+  viewport.onpointerdown = _onPointerDown;
+  viewport.onpointermove = _onPointerMove;
+  viewport.onpointerup = _endPointerDrag;
+  viewport.onpointercancel = _endPointerDrag;
+  viewport.onpointerleave = _endPointerDrag;
+  viewport.onwheel = _zoomFromWheel;
+  viewport.onclick = _onViewportClick;
+  viewport.addEventListener('touchstart', _onTouchStart, {passive: false});
+  viewport.addEventListener('touchmove', _onTouchMove, {passive: false});
+  viewport.addEventListener('touchend', _onTouchEnd);
+  viewport.addEventListener('touchcancel', function _onTouchCancel(){ state.pinching = false; });
+
+  if(window && typeof window.addEventListener === 'function'){
+    window.addEventListener('resize', _onResize);
+    lb._imgZoomResizeHandler = _onResize;
+  }
+
+  if(img.complete && img.naturalWidth){
+    _onImgLoad();
+  }
+  // Always attach onload — a cached/fast image may have taken the sync
+  // branch above, but navigation (src swap) still needs the handler.
+  img.onload = _onImgLoad;
+
+  return state;
+}
+
 function _openImgLightboxWithNav(src, alt, images, index) {
   const lb = document.createElement('div');
   lb.className = 'img-lightbox';
   lb.setAttribute('role', 'dialog');
   lb.setAttribute('aria-modal', 'true');
   lb.setAttribute('aria-label', alt || 'Image');
+  // Zoomable stage: viewport (clip + gestures) > canvas (transform) > img.
+  const viewport = document.createElement('div');
+  viewport.className = 'img-lightbox-viewport';
+  const canvas = document.createElement('div');
+  canvas.className = 'img-lightbox-canvas';
   const img = document.createElement('img');
   img.src = src;
   img.alt = alt || '';
-  img.onclick = e => e.stopPropagation();
+  img.draggable = false;
+  canvas.appendChild(img);
+  viewport.appendChild(canvas);
   const cls = document.createElement('button');
   cls.className = 'img-lightbox-close';
   cls.setAttribute('aria-label', 'Close');
   cls.textContent = '×';
   cls.onclick = () => _closeImgLightbox(lb);
-  lb.appendChild(img);
+  lb.appendChild(viewport);
   lb.appendChild(cls);
   // Prev/Next navigation — store index and images on lb so a single set of
   // handlers reads live values without closure churn on every nav.
@@ -2415,6 +2661,10 @@ function _openImgLightboxWithNav(src, alt, images, index) {
   }
   lb.onclick = () => _closeImgLightbox(lb);
   document.body.appendChild(lb);
+  // Mount zoom gestures AFTER the stage is in the DOM — a synchronously
+  // decoded image (data: URL or cache-hit) otherwise measures a 0x0
+  // viewport and fit-zooms to a near-zero scale.
+  lb._zoom = _mountImgLightboxZoom(viewport, canvas, img, lb);
   // Single keyboard handler — reads lb._navX live, no remove/add churn.
   lb._keyHandler = e => {
     if(e.key==='Escape'){ _closeImgLightbox(lb); return; }
@@ -2437,6 +2687,9 @@ function _navigateLightbox(lb, direction) {
   lbImg.src = nextImg.src;
   lbImg.alt = nextImg.alt || '';
   lb.setAttribute('aria-label', nextImg.alt || 'Image');
+  // Keep the current zoom level when switching images (re-centre on the
+  // new image once it loads) — matches native photo-gallery behaviour.
+  if(lb._zoom) lb._zoom.pendingNav = true;
   // Update counter via stored reference — no DOM query.
   if(lb._counterEl) lb._counterEl.textContent = (newIndex+1) + ' / ' + images.length;
 }
@@ -2449,6 +2702,13 @@ function _closeImgLightbox(lb) {
   if(lb._mermaidResizeTimer && typeof clearTimeout === 'function'){
     clearTimeout(lb._mermaidResizeTimer);
     lb._mermaidResizeTimer = null;
+  }
+  if(lb._imgZoomResizeHandler && window && typeof window.removeEventListener === 'function'){
+    window.removeEventListener('resize', lb._imgZoomResizeHandler);
+  }
+  if(lb._imgZoomResizeTimer && typeof clearTimeout === 'function'){
+    clearTimeout(lb._imgZoomResizeTimer);
+    lb._imgZoomResizeTimer = null;
   }
   lb.style.animation = 'lb-in .12s ease reverse';
   setTimeout(() => lb.parentNode && lb.parentNode.removeChild(lb), 120);
@@ -5676,6 +5936,16 @@ let _scrollPinned=true;
 let _programmaticScroll=false;
 let _programmaticScrollSetAt=0;
 let _programmaticScrollResetTimer=0;
+const PROGRAMMATIC_SCROLL_VALID_MS=150;
+function _freshProgrammaticScrollActive(){
+  if(!_programmaticScroll) return false;
+  const age=performance.now()-_programmaticScrollSetAt;
+  if(!Number.isFinite(age)||age<0||age>PROGRAMMATIC_SCROLL_VALID_MS){
+    _programmaticScroll=false;
+    return false;
+  }
+  return true;
+}
 function _deferClearProgrammaticScroll(ms){clearTimeout(_programmaticScrollResetTimer);_programmaticScrollResetTimer=setTimeout(()=>{_programmaticScroll=false;},ms||80);}
 let _nearBottomCount=0;
 let _lastScrollTop=null;
@@ -5778,21 +6048,14 @@ function _recordNonMessageScrollIntent(e){
   if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
     if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
   }
-  // #4970: record ANY upward message-pane wheel motion as recent wheel intent,
-  // including gentle low-delta trackpad wheels (e.g. deltaY:-5) that never reach
-  // the decisive -30 sticky-unpin threshold below. The post-render artifact
-  // suppression consults _recentMessageWheelIntent() so it cannot swallow a real
-  // gentle scroll-up. This does NOT unpin on its own — only the <-30 branch and
-  // the scroll listener's movedUp branch flip _messageUserUnpinned.
-  if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
-    const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
-    if(bottomDistance>120) _lastMessageScrollIntentMs=performance.now();
-  }
   if(typeof e.deltaY==='number'&&e.deltaY<0) _lastMessageWheelIntentMs=performance.now();
-  if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)){
+  // Keep e.deltaY< -30 as the ordinary direct sticky-unpin threshold.
+  const wheelUp=typeof e.deltaY==='number'&&e.deltaY<0;
+  const guardedWheelUp=wheelUp&&_freshProgrammaticScrollActive();
+  if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
     _cancelBottomSettle();
     if(e.type==='touchmove') _markMessageTouchScrollIntent(true);
-    if(typeof e.deltaY==='number'&&e.deltaY< -30){
+    if((typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
       _messageUserUnpinned=true;
       _nearBottomCount=0;
       _scrollPinned=false;
@@ -5809,6 +6072,19 @@ function _recordNonMessageScrollIntent(e){
         _scrollPinned=false;
       }
     }
+  }
+  // #4970: record ANY upward message-pane wheel motion as recent wheel intent,
+  // including gentle low-delta trackpad wheels (e.g. deltaY:-5) that never reach
+  // the decisive -30 sticky-unpin threshold below. The post-render artifact
+  // suppression consults _recentMessageWheelIntent() so it cannot swallow a real
+  // gentle scroll-up. Ordinarily this does NOT unpin on its own: the <-30 branch
+  // and the scroll listener's movedUp branch remain the stable threshold. The
+  // exception is an active programmatic-scroll guard. That guard returns before
+  // its listener can see the native scroll event, so even a small capture-phase
+  // upward wheel input must immediately stop live-tail follow (#6414).
+  if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
+    const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
+    if(bottomDistance>120) _lastMessageScrollIntentMs=performance.now();
   }
 }
 function _recentNonMessageScrollIntent(){
@@ -6039,8 +6315,7 @@ if(typeof window!=='undefined'){
   let _scrollRaf=0;
   el.addEventListener('scroll',()=>{
     _scheduleMessageVirtualizedRender();
-    if(_programmaticScroll&&(performance.now()-_programmaticScrollSetAt)>150) _programmaticScroll=false;
-    if(_programmaticScroll) return;
+    if(_freshProgrammaticScrollActive()) return;
     _markMessageVirtualScrollActive();
     cancelAnimationFrame(_scrollRaf);
     _scrollRaf=requestAnimationFrame(()=>{
@@ -10125,7 +10400,7 @@ function _renderLockManualInstruction(target, res){
   code.style.background='rgba(0,0,0,0.05)';
   code.style.padding='6px';
   code.style.margin='4px 0';
-  code.style.fontFamily='ui-monospace,monospace';
+  code.style.fontFamily='var(--font-mono)';
   code.style.borderRadius='4px';
   code.style.whiteSpace='pre-wrap';
   code.style.wordBreak='break-all';
@@ -10373,22 +10648,126 @@ function _pendingCurrentTailUserMessage(messages){
   return null;
 }
 
+// Precision-only epsilon when matching a transcript row against
+// session.pending_started_at. The server stamps the active turn's user row with
+// the exact pending_started_at float; state.db round-trips can lose
+// sub-microsecond precision, so 1e-6 absorbs float drift without ever treating a
+// whole-second (or sub-second) difference as identity. Anything wider is
+// ambiguous — a fast "继续"/"continue" double-send lands ~1s after the previous
+// turn — and must NOT match: fail toward materializing the pending turn (a
+// harmless transient duplicate the settle render clears) rather than hiding a
+// turn and moving its attachments onto an earlier row.
+const _PENDING_ACTIVE_TURN_TS_EPSILON=1e-6;
+
+function _messageTimestampSeconds(msg){
+  if(!msg) return null;
+  const raw=msg._ts!=null?msg._ts:msg.timestamp;
+  const value=Number(raw);
+  return Number.isFinite(value)&&value>0?value:null;
+}
+
+/**
+ * Exact-identity match for the active turn's user row via its
+ * `_active_turn_token`, mirroring the server's `build_active_turn_token`
+ * ("{stream_id}:{started_at}") stamped by the eager-checkpoint path. The token
+ * embeds the stream_id, which no other turn can share, so a row carrying the
+ * current session's token IS the active turn — no timestamp tolerance needed.
+ */
+function _activeTurnTokenMatches(msg, session){
+  if(!msg||typeof msg._active_turn_token!=='string') return false;
+  const streamId=session&&session.active_stream_id;
+  const startedAt=Number(session&&session.pending_started_at);
+  if(!streamId||!Number.isFinite(startedAt)||startedAt<=0) return false;
+  const sep=msg._active_turn_token.lastIndexOf(':');
+  if(sep<=0) return false;
+  if(msg._active_turn_token.slice(0,sep).trim()!==String(streamId).trim()) return false;
+  const tokenStarted=Number(msg._active_turn_token.slice(sep+1));
+  return Number.isFinite(tokenStarted)&&tokenStarted>0
+    && Math.abs(tokenStarted-startedAt)<=_PENDING_ACTIVE_TURN_TS_EPSILON;
+}
+
+/**
+ * Find the active turn's user row even when the current turn's output already
+ * follows it in the transcript.
+ *
+ * While a turn is live the server can reconcile the current user row into the
+ * returned transcript (the sidecar/state.db merge picks it up from state.db,
+ * where the agent writes it immediately) while `pending_user_message` is still
+ * set. The row is then followed by that same turn's assistant/tool rows, so the
+ * strict tail scan in `_pendingCurrentTailUserMessage` stops at the completed
+ * assistant and reports "no current user row" — and the caller materializes the
+ * pending prompt a SECOND time, rendering a duplicate user bubble until the
+ * settle render replaces the list.
+ *
+ * Scanning past assistant/tool rows alone would be wrong: a user who submits the
+ * same text twice in a row (a plain "继续" follow-up) legitimately gets two
+ * identical user turns, and matching on text would swallow the new one. The
+ * discriminator is therefore exact identity, never proximity: the active turn's
+ * row either carries the server-stamped `_active_turn_token` (stream_id +
+ * started_at — unique to this turn), or its timestamp equals `pending_started_at`
+ * within a precision-only epsilon that absorbs float/state.db drift but never a
+ * full second. A whole-second (or sub-second) mismatch is ambiguous and returns
+ * null so the caller materializes the pending turn — the transient duplicate is
+ * harmless, hiding a turn + moving its attachments is not. Text equality is
+ * still required downstream, so a false match needs identical text AND an exact
+ * identity signal.
+ */
+function _pendingActiveTurnUserMessage(messages, session){
+  const startedAt=Number(session?.pending_started_at);
+  if(!Number.isFinite(startedAt)||startedAt<=0) return null;
+  const list=Array.isArray(messages)?messages:[];
+  for(let i=list.length-1;i>=0;i--){
+    const msg=list[i];
+    if(!msg||String(msg.role||'')!=='user') continue;
+    if(typeof _isContextCompactionMessage==='function'&&_isContextCompactionMessage(msg)) continue;
+    // Unambiguous: the row carries the active turn's exact token
+    // (stream_id + started_at) stamped by the server's eager-checkpoint path.
+    if(typeof _activeTurnTokenMatches==='function'&&_activeTurnTokenMatches(msg,session)) return msg;
+    // Unambiguous: the row's timestamp IS pending_started_at within
+    // precision-only float drift (never a whole second).
+    const ts=_messageTimestampSeconds(msg);
+    if(ts===null) continue;
+    if(Math.abs(ts-startedAt)<=_PENDING_ACTIVE_TURN_TS_EPSILON) return msg;
+  }
+  // Any wider drift (whole-second truncation, a rapid repeat ~1s later) is
+  // ambiguous: return null so getPendingSessionMessage() materializes the
+  // pending turn rather than guessing.
+  return null;
+}
+
 function getPendingSessionMessage(session, messagesOverride=null){
   const text=String(session?.pending_user_message||'').trim();
   if(!text) return null;
   const attachments=Array.isArray(session?.pending_attachments)?session.pending_attachments.filter(Boolean):[];
   const sourceMessages=Array.isArray(messagesOverride)?messagesOverride:session?.messages;
   const messages=Array.isArray(sourceMessages)?sourceMessages:[];
+  const pendingCandidate={role:'user',content:text};
+  const _matchesPending=(row)=>{
+    if(!row) return false;
+    return typeof _sameTranscriptMessage==='function'
+      ? _sameTranscriptMessage(row,pendingCandidate)
+      : String(msgContent(row)||'').trim()===text;
+  };
+  const _adoptExistingRow=(row)=>{
+    if(attachments.length&&!row.attachments?.length) row.attachments=attachments;
+    return null;
+  };
   const currentTailUser=_pendingCurrentTailUserMessage(messages);
   if(currentTailUser){
-    const pendingCandidate={role:'user',content:text};
-    const sameCurrentTurn=typeof _sameTranscriptMessage==='function'
-      ? _sameTranscriptMessage(currentTailUser,pendingCandidate)
-      : String(msgContent(currentTailUser)||'').trim()===text;
-    if(sameCurrentTurn){
-      if(attachments.length&&!currentTailUser.attachments?.length) currentTailUser.attachments=attachments;
-      return null;
-    }
+    const sameCurrentTurn=_matchesPending(currentTailUser);
+    if(sameCurrentTurn) return _adoptExistingRow(currentTailUser);
+  }
+  // Fallback: the current turn's user row is already in the transcript but the
+  // strict tail scan above could not see it because this turn's assistant/tool
+  // output follows it. Matched by pending_started_at, so previous turns that
+  // repeat the same text are unaffected. Guarded with typeof so a partial load
+  // (or a static probe that extracts only some helpers) degrades to the
+  // original strict-tail behaviour instead of throwing.
+  const activeTurnUser=typeof _pendingActiveTurnUserMessage==='function'
+    ? _pendingActiveTurnUserMessage(messages,session)
+    : null;
+  if(activeTurnUser&&activeTurnUser!==currentTailUser&&_matchesPending(activeTurnUser)){
+    return _adoptExistingRow(activeTurnUser);
   }
   return {
     role:'user',
@@ -13546,6 +13925,67 @@ function _armKeepSettledWorklogOpen(streamId){
 function _disarmKeepSettledWorklogOpen(){
   _keepSettledWorklogOpenForStreamId=null;
 }
+function _assistantTurnHasVisibleRenderedSegment(turn){
+  if(!turn||typeof turn.querySelectorAll!=='function') return null;
+  for(const seg of turn.querySelectorAll('.assistant-segment')){
+    if(seg.classList.contains('assistant-segment-worklog-source')) continue;
+    if(seg.classList.contains('assistant-segment-anchor')) continue;
+    if((seg.textContent||'').trim()) return true;
+  }
+  return false;
+}
+function _collapseJustSettledWorklogInPlace(streamId){
+  // #6414: STREAM_DONE used to render the settled turn once with its Worklog
+  // forced open, then immediately run a second full render only to collapse it.
+  // That second `innerHTML=''` rebuild removes the Worklog the user just saw and
+  // can expose a reset frame. Keep the canonical first render, then collapse its
+  // one settled group in place. The rows are released after the group is hidden;
+  // an expand still rebuilds them from the settled transcript via the normal
+  // #5839 deferred-row path.
+  const inner=$('msgInner');
+  if(!inner||!streamId) return false;
+  const group=Array.from(inner.querySelectorAll('[data-anchor-settled-scene-owner="1"]'))
+    .filter(candidate=>candidate.getAttribute('data-anchor-stream-id')===String(streamId))
+    .pop();
+  if(!group) return false;
+  const ownerTurn=typeof group.closest==='function'?group.closest('.assistant-turn'):null;
+  const ownerHasVisibleSegment=_assistantTurnHasVisibleRenderedSegment(ownerTurn);
+  if(ownerHasVisibleSegment===null) return false;
+  const disclosureKey=group.getAttribute('data-activity-disclosure-key')||'';
+  const savedDisclosure=_readActivityDisclosureState(disclosureKey);
+  const rows=_deferredWorklogRowsFromGroup(group);
+  if(!rows||!rows.length) return false;
+  const match=/^anchor-scene:(\d+)$/.exec(disclosureKey);
+  const message=match&&S.messages&&S.messages[Number(match[1])];
+  const errored=!!(message&&message._anchor_activity_scene&&
+    _anchorSceneHasErroredTerminalState(message._anchor_activity_scene));
+  const keepOpen=!ownerHasVisibleSegment
+    || savedDisclosure==='open'
+    || (errored&&savedDisclosure!=='closed')
+    || (_worklogDetailsExpandedDefault()&&savedDisclosure!=='closed');
+  if(!keepOpen){
+    const detailDisclosure=typeof _captureWorklogDetailDisclosureState==='function'
+      ? _captureWorklogDetailDisclosureState(group)
+      : null;
+    group._deferredWorklogRows=rows;
+    group._deferredWorklogDisclosure=detailDisclosure&&detailDisclosure.size
+      ? detailDisclosure
+      : null;
+    group.setAttribute('data-worklog-rows-deferred','1');
+    group.classList.add('tool-call-group-collapsed');
+    group.classList.remove('open');
+    const summary=group.querySelector('.tool-worklog-summary,.tool-call-group-summary');
+    if(summary) summary.setAttribute('aria-expanded','false');
+    _syncToolCallGroupSummary(group);
+    requestAnimationFrame(()=>{
+      if(!group.isConnected||!group.classList.contains('tool-call-group-collapsed')) return;
+      if(group.getAttribute('data-worklog-rows-deferred')!=='1') return;
+      const list=_toolWorklogListEl(group);
+      if(list) list.replaceChildren();
+    });
+  }
+  return true;
+}
 // True while a just-settled worklog is being force-rendered open (between
 // _armKeepSettledWorklogOpen and _disarmKeepSettledWorklogOpen). renderMessages()
 // consults this so it does NOT write the forced-open DOM into _sessionHtmlCache:
@@ -16478,9 +16918,10 @@ function renderMessages(options){
       if((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
       else if(window._showThinking!==false) seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
     }
-    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||statusHtml||recoveryHtml);
+    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||recoveryHtml);
     if(statusHtml){
       seg.insertAdjacentHTML('beforeend', statusHtml);
+      if(hasVisibleBody) seg.insertAdjacentHTML('beforeend', `${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`);
     }else if(hasVisibleBody){
       seg.insertAdjacentHTML('beforeend', `${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`);
     }else if(!(thinkingText&&window._showThinking!==false&&!isSimplifiedToolCalling())){
@@ -17182,11 +17623,12 @@ function renderMessages(options){
   // (Opus advisor, stage-342).
   {
     const _turnHasVisibleContent=(turn)=>{
-      const segs=turn.querySelectorAll('.assistant-segment');
-      for(const seg of segs){
-        // A segment shows real content only when it is NOT worklog-folded AND its
-        // body/files/status actually painted (the anchor-only placeholder class
-        // carries no visible body).
+      if(typeof _assistantTurnHasVisibleRenderedSegment==='function'){
+        return _assistantTurnHasVisibleRenderedSegment(turn)===true;
+      }
+      // Keep the extracted renderMessages test harness self-contained.
+      if(!turn||typeof turn.querySelectorAll!=='function') return false;
+      for(const seg of turn.querySelectorAll('.assistant-segment')){
         if(seg.classList.contains('assistant-segment-worklog-source')) continue;
         if(seg.classList.contains('assistant-segment-anchor')) continue;
         if((seg.textContent||'').trim()) return true;
